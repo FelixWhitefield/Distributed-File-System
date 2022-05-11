@@ -35,10 +35,10 @@ public class TestClient {
                 client.store(file3);
                 client.store(file4);
 
+                for (var s : client.list()) {
+                    System.out.println(s);
+                }
 
-
-                Thread.sleep(10000);
-                client.remove("testfile");
             }
         } catch (Exception e) {
             e.printStackTrace();

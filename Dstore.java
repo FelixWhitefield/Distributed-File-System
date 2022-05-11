@@ -6,7 +6,18 @@ import java.net.UnknownHostException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.io.PrintWriter;
@@ -130,7 +141,6 @@ public class Dstore {
                 return;
             }
             
-            
             try {
                 while(!socket.isClosed()) {
                     String message = in.readLine();
@@ -150,25 +160,69 @@ public class Dstore {
             logger.info("Message received from client, " + socket.getPort() + ": " + message);
 
             try {
-                var operation = getOperation(message);
                 var arguments = message.split(" ");
-                if (operation.equals("STORE")) {
-                    var filename = arguments[1];
-                    var filesize = Integer.parseInt(arguments[2]);
 
-                    out.println("ACK"); // Notify client message received
-
-                    store(filename, filesize);
-                } else if (operation.equals("LOAD_DATA")) {
-                    var filename = arguments[1];
-
-                    load(filename);
-                } else {
-                    logger.err("Malformed message");
+                switch (getOperation(message)) {
+                    case "STORE" -> {
+                        var filename = arguments[1];
+                        var filesize = Integer.parseInt(arguments[2]);
+                        out.println("ACK"); // Notify client message received
+                        store(filename, filesize);
+                    }
+                    case "LOAD_DATA" -> {
+                        var filename = arguments[1];
+                        load(filename);
+                    }
+                    case "REBALANCE_STORE" -> {
+                        var filename = arguments[1];
+                        var filesize = Integer.parseInt(arguments[2]);
+                        out.println("ACK"); // Notify dstore message received
+                        rebalanceStore(filename, filesize);
+                    }
+                    default -> logger.err("Malformed message");
                 }
+
+                // if (operation.equals("STORE")) {
+                //     var filename = arguments[1];
+                //     var filesize = Integer.parseInt(arguments[2]);
+
+                //     out.println("ACK"); // Notify client message received
+
+                //     store(filename, filesize);
+                // } else if (operation.equals("LOAD_DATA")) {
+                //     var filename = arguments[1];
+                //     load(filename);
+                // } else if (operation.equals("REBALANCE_STORE")) {
+                //     var filename = arguments[1];
+                //     var filesize = Integer.parseInt(arguments[2]);
+                //     out.println("ACK"); // Notify dstore message received
+                //     rebalanceStore(filename, filesize);
+                // }
+                // else {
+                //     logger.err("Malformed message");
+                // }
             } catch (Exception e) {
                 logger.err("Error in handling message");
             }
+        }
+
+        public void rebalanceStore(String filename, Integer filesize) {
+            try {
+                //Get data from dstore
+                byte[] data = new byte[filesize];
+                socket.getInputStream().readNBytes(data, 0, filesize);
+
+                //Store data in folder
+                Path path = Paths.get(fileFolder, filename);
+                Files.write(path, data);
+
+                logger.info("Store of file '" + filename + "' complete");
+                socket.close();
+                return;
+            } catch (Exception e) {
+                e.printStackTrace();
+                logger.err("Error in storing file");
+            } 
         }
 
         public void store(String filename, Integer filesize) {
@@ -232,7 +286,6 @@ public class Dstore {
                 e.printStackTrace();
             } finally { // Close socket gracefully
                 logger.info("Server offline");
-
                 try {
                     cout.close();
                 } finally {
@@ -243,25 +296,83 @@ public class Dstore {
                             socket.close();
                         } catch (IOException e) {} 
                     }
-                    //END LIFE
                 }
             }
         }
 
         public void handleMessage(String message) {
             try {
-                String operation = getOperation(message);
                 var arguments = message.split(" ");
-    
-                if (operation.equals("REMOVE")) {
-                    var filename = arguments[1];
 
-                    remove(filename);                    
-                } else if (operation.equals("LIST")) {
-                    list();
+                switch (getOperation(message)) {
+                    case "LIST" -> list();
+                    case "REMOVE" -> {
+                        var filename = arguments[1];
+                        remove(filename);   
+                    }
+                    case "REBALANCE" -> {
+                        var rebal = Arrays.asList(arguments);
+                        HashMap<String, Set<Integer>> filesToSend = new HashMap<>();
+                        ArrayList<String> filesToDelete = new ArrayList<>();
+                        var iter = rebal.iterator();
+                        iter.next();
+                        // Get values from message
+                        var noOfFiles = Integer.parseInt(iter.next());
+                        for (int i = 0; i < noOfFiles; i++) {
+                            var filename = iter.next();
+                            var noOfPorts = Integer.parseInt(iter.next());
+                            Set<Integer> ports = new HashSet<>();
+                            for (int j = 0; j < noOfPorts; j++) {
+                                ports.add(Integer.parseInt(iter.next()));
+                            }
+                            filesToSend.put(filename, ports);
+                        }
+                        var noOfFilesDelete = Integer.parseInt(iter.next());
+                        for (int i = 0; i < noOfFilesDelete; i ++) {
+                            filesToDelete.add(iter.next());
+                        }
+                        rebalance(filesToSend, filesToDelete);
+                    }
+                    default -> logger.err("Malformed Message");
                 }
+    
+                // if (operation.equals("REMOVE")) {
+                //     var filename = arguments[1];
+
+                //     remove(filename);                    
+                // } else if (operation.equals("LIST")) {
+                //     list();
+                // } else if (operation.equals("REBALANCE")) {
+                //     var rebal = Arrays.asList(arguments);
+
+                //     HashMap<String, Set<Integer>> filesToSend = new HashMap<>();
+                //     ArrayList<String> filesToDelete = new ArrayList<>();
+
+                //     var iter = rebal.iterator();
+                //     iter.next();
+
+                //     var noOfFiles = Integer.parseInt(iter.next());
+                //     for (int i = 0; i < noOfFiles; i++) {
+                //         var filename = iter.next();
+                //         var noOfPorts = Integer.parseInt(iter.next());
+                //         Set<Integer> ports = new HashSet<>();
+                //         for (int j = 0; j < noOfPorts; j++) {
+                //             ports.add(Integer.parseInt(iter.next()));
+                //         }
+                //         filesToSend.put(filename, ports);
+                //     }
+                //     var noOfFilesDelete = Integer.parseInt(iter.next());
+                //     for (int i = 0; i < noOfFilesDelete; i ++) {
+                //         filesToDelete.add(iter.next());
+                //     }
+                    
+                //     rebalance(filesToSend, filesToDelete);
+                // } else {
+                //     logger.err("Malformed Message");
+                // }
             } catch (Exception e) {
-                logger.err("Malformed Message");
+                e.printStackTrace();
+                logger.err("Error handling message");
             } 
         }
 
@@ -290,7 +401,83 @@ public class Dstore {
             }
         }
 
+        public void rebalance(HashMap<String, Set<Integer>> filesToSend, ArrayList<String> filesToDelete) {
+            ExecutorService executor = Executors.newCachedThreadPool();
+            List<SendFile> allFilesSend = new ArrayList<>();
+
+            filesToSend.entrySet().stream().forEach(e -> {
+                Integer filesize;
+                try {
+                    filesize = (int) Files.size(Paths.get(fileFolder, e.getKey()));
+                } catch (IOException e1) {
+                    return;
+                }
+                
+                e.getValue().forEach(p -> {
+                    allFilesSend.add(new SendFile(e.getKey(), p, filesize));
+                });
+            });
+            try {
+                var complete = executor.invokeAll(allFilesSend);
+                var allSuccessful = complete.stream().allMatch(e -> {
+                    try {
+                        return e.get();
+                    } catch (Exception ex) {
+                        return false;
+                    }
+                });
+                if (!allSuccessful) return;
+            } catch (InterruptedException e1) {
+                return;
+            }
+
+            filesToDelete.forEach(f -> {
+                try {
+                    Files.deleteIfExists(Paths.get(f));
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            });
+        }
+
+        public static class SendFile implements Callable<Boolean> {
+            String filename;
+            Integer filesize;
+            Integer port;
+    
+            public SendFile(String filename, Integer port, Integer filesize) {
+                this.filename = filename;
+                this.filesize = filesize;
+                this.port = port;
+            }
+
+            @Override
+            public Boolean call() {
+                try (
+                    Socket socket = new Socket("localhost", port);
+                    PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+                    BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                ) {
+                    socket.setSoTimeout(timeout);
+    
+                    out.println("REBALANCE_STORE " + filename + " " + filesize);
+                    if (in.readLine().equals("ACK")) {
+                        byte[] data = Files.readAllBytes(Paths.get(fileFolder, filename));
+                        socket.getOutputStream().write(data);
+                        logger.info("'" + filename + "' sent to: " + port);
+                        return true;
+                    } 
+                } catch (IOException e) { 
+                    e.printStackTrace();
+                } 
+                return false;
+            }
+            
+        }
+
     }
+
+
 
     private static String getOperation(String message) {
         return message.split(" ", 2)[0];

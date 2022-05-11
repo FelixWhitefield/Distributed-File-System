@@ -19,6 +19,7 @@ import java.util.Map.Entry;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -44,9 +45,11 @@ public class Controller {
     private static Index index = new Index();
 
     //Blocking queues
-    private static ConcurrentHashMap<String, BlockingQueue<Integer>> awaitingStoreAcks = new ConcurrentHashMap<>();
-    private static ConcurrentHashMap<String, BlockingQueue<Integer>> awaitingRemoveAcks = new ConcurrentHashMap<>();
     private static BlockingQueue<Entry<Integer,String>> awaitingList;
+
+    //Attempting using Countdown Latch
+    private static ConcurrentHashMap<String, CountDownLatch> awaitingStore = new ConcurrentHashMap<>();
+    private static ConcurrentHashMap<String, CountDownLatch> awaitingRemove = new ConcurrentHashMap<>();
 
     //Locks
     private static ReentrantLock statusCheckLock = new ReentrantLock();
@@ -66,10 +69,14 @@ public class Controller {
             logger.err("Malformed arguemnts; java Controller cport R timeout rebalance_period");
             return;
         }
+        if (!(replicationFactor > 0 && timeout > 0 && rebalancePeriod > 0)) {
+            logger.err("Arguments must be > 0");
+            return;
+        }
 
         logger.info("Accepting Connections");
         ScheduledExecutorService ses = Executors.newSingleThreadScheduledExecutor();
-        ses.schedule(new Rebalance(), 10, TimeUnit.SECONDS);
+        ses.scheduleAtFixedRate(new Rebalance(), rebalancePeriod, rebalancePeriod, TimeUnit.SECONDS);
         acceptConnections();
     }
 
@@ -90,6 +97,10 @@ public class Controller {
         @Override
         public void run() {
             logger.info("Attemping rebalance");
+            if (dStores.size() < replicationFactor) {
+                logger.err("Cannot Rebalance - NOT ENOUGH DSTORES");
+                return;
+            }
             rebalanceLock.writeLock().lock();
 
             //ATTEMPT TO GET LIST FROM EACH DSTORE
@@ -113,6 +124,7 @@ public class Controller {
                     awaitingList = null;
                     executor.shutdown();
                 }
+                
 
                 //COMPARE FILES FROM DSTORE TO FILES LIST THAT CONTROLLER HAS
                 HashMap<Integer, ArrayList<String>> extraFiles = new HashMap<>(); // Extra files the dstores have (not in controller list)
@@ -122,89 +134,144 @@ public class Controller {
                 
                 for (Entry<Integer, ArrayList<String>> entry : missingFiles.entrySet()) { // Remove files which dstores do not have
                     dStores.get(entry.getKey()).getFiles().removeAll(entry.getValue());
-                    logger.info(entry.getKey() + entry.getValue().toString());
                 }
-                ArrayList<String> filesNotStored = new ArrayList<>();
-                for (String file : index.keySet()) { // Check that each file in index is stored at least once (if not remove from index)
-                    var anyContain = dStores.entrySet().stream().anyMatch(e -> e.getValue().getFiles().contains(file));
-                    if (!anyContain) filesNotStored.add(file);
-                }
-                index.keySet().removeAll(filesNotStored);
+
+                index.keySet().stream().forEach(f -> {
+                    if (!dStores.entrySet().stream().anyMatch(e -> e.getValue().getFiles().contains(f))) index.remove(f);
+                });
+
                 HashMap<Integer, ArrayList<String>> filesToRemove = new HashMap<>();
-                for (var dstorePort : dStores.keySet()) { // Populate with empty array
-                    filesToRemove.put(dstorePort, new ArrayList<>());
-                }
+                dStores.keySet().forEach(k -> filesToRemove.put(k, new ArrayList<>()));
                 
                 // Attempt to fix remove in progress files
                 var filesRemovingInProgress = index.entrySet().stream()
                     .filter(e -> Objects.equals(e.getValue().getStatus(), status.remove_in_progress))
                     .map(Map.Entry::getKey).collect(Collectors.toList());
 
-                for (String filename : filesRemovingInProgress) {
-                    new attemptRemoveInProgress(filename).start();
-                }
+                filesRemovingInProgress.stream().forEach(f -> new fixRemoveInProgress(f).start());
+
                 //Rebalance now
-                Boolean balanced = dStores.entrySet().stream()
-                    .map(e -> e.getValue().getFiles().stream().filter(f -> index.isStoreComplete(f)).collect(Collectors.toList()).size())
+                HashMap<Integer, Set<Entry<Integer, String>>> filesToSend = new HashMap<>();
+                HashMap<Integer, ArrayList<String>> filesToDelete = new HashMap<>();
+                HashMap<Integer, Set<String>> dStoresCopy = new HashMap<>();
+                dStores.entrySet().stream().forEach(e -> dStoresCopy.put(e.getKey(), 
+                    e.getValue().getFiles().stream().filter(f -> index.getStatus(f).equals(status.store_complete)).collect(Collectors.toSet())));
+                dStoresCopy.keySet().stream().forEach(e -> {
+                    filesToSend.put(e, new HashSet<>()); filesToDelete.put(e, new ArrayList<>());
+                });
+
+                //ENSURE FILE IS REPLICATED R TIMES
+                for (String filename : index.keySet()) {
+                    Integer copies = dStoresCopy.entrySet().stream()
+                        .filter(e -> e.getValue().contains(filename))
+                        .collect(Collectors.toList()).size();
+
+                    while (!copies.equals(replicationFactor)) {
+                        if (copies > replicationFactor) {
+                            Integer dStoreToRemove = 
+                                (dStoresCopy.entrySet().stream().filter(e -> e.getValue().contains(filename))
+                                .sorted(Comparator.comparing(e -> dStoresCopy.get(e.getKey()).size(), Comparator.reverseOrder()))
+                                .collect(Collectors.toList())).get(0).getKey();
+                            dStoresCopy.get(dStoreToRemove).remove(filename);
+                            filesToRemove.get(dStoreToRemove).add(filename);
+                        } else if (copies < replicationFactor) {
+                            Integer dStoreToReceive = 
+                                (dStoresCopy.entrySet().stream().filter(e -> !e.getValue().contains(filename))
+                                .sorted(Comparator.comparingInt(e -> dStoresCopy.get(e.getKey()).size()))
+                                .collect(Collectors.toList())).get(0).getKey();
+                            Integer dStoreToGet = 
+                                (dStoresCopy.entrySet().stream().filter(e -> e.getValue().contains(filename))
+                                .sorted(Comparator.comparing(e -> dStoresCopy.get(e.getKey()).size()))
+                                .collect(Collectors.toList())).get(0).getKey();
+                            dStoresCopy.get(dStoreToReceive).add(filename);
+                            filesToSend.get(dStoreToGet).add(Map.entry(dStoreToReceive, filename));
+                        }
+                        copies = dStoresCopy.entrySet().stream()
+                            .filter(e -> e.getValue().contains(filename))
+                            .collect(Collectors.toList()).size();
+                    } 
+                }
+
+                //ENSURE DSTORES HAVE FILES EVENLY SPREAD
+                Boolean balanced = dStoresCopy.entrySet().stream()
+                    .map(e -> e.getValue().stream().filter(f -> index.isStoreComplete(f)).collect(Collectors.toList()).size())
                     .allMatch(e -> (e >= Math.floor((replicationFactor * index.sizeCompleted())/(float)dStores.size())) 
                         || (e >= Math.ceil((replicationFactor * index.sizeCompleted())/(float)dStores.size())));
 
-                if (balanced) return;
+                while (!balanced) {
+                    ArrayList<Integer> dStoresSorted = new ArrayList<>(dStoresCopy.keySet().stream()
+                        .sorted(Comparator.comparingInt(e -> dStoresCopy.get(e).size()))
+                        .collect(Collectors.toList()));
+                    Integer dStoreToReceive = dStoresSorted.get(0);
+                    Integer dStoreToSend = dStoresSorted.get(dStoresSorted.size() - 1);
+                    String fileToMove = dStoresCopy.get(dStoreToSend).stream()
+                        .filter(f -> !dStoresCopy.get(dStoreToReceive).contains(f))
+                        .collect(Collectors.toList()).get(0);
 
-                HashMap<Integer, HashMap<Integer, String>> filesToSend = new HashMap<>();
-                HashMap<Integer, ArrayList<String>> filesToDelete = new HashMap<>();
-                var dStoreCopy = dStores.entrySet().stream().collect(Collectors.toMap(e -> e.getKey(), e -> List.copyOf(e.getValue().getFiles())));
-                // Ensure each file is replicated R times
-                for (String file : index.keySet()) {
-                    var noOfCopies = dStoreCopy.values().stream().filter(e -> e.contains(file)).collect(Collectors.toList()).size();
-                    logger.info(noOfCopies);
+                    filesToSend.get(dStoreToSend).add(Map.entry(dStoreToReceive, fileToMove));
+                    filesToDelete.get(dStoreToSend).add(fileToMove);
+                    dStoresCopy.get(dStoreToSend).remove(fileToMove);
+                    dStoresCopy.get(dStoreToReceive).add(fileToMove);
+
+                    balanced = dStoresCopy.entrySet().stream()
+                        .map(e -> e.getValue().stream().filter(f -> index.isStoreComplete(f)).collect(Collectors.toList()).size())
+                        .allMatch(e -> (e >= Math.floor((replicationFactor * index.sizeCompleted())/(float)dStoresCopy.size())) 
+                            || (e >= Math.ceil((replicationFactor * index.sizeCompleted())/(float)dStoresCopy.size())));
+                }
+
+                // SEND MESSAGES :)
+                if (!(dStoresCopy.size() == dStores.size())) return; // Ensure no dStore has disconnected
+
+                for (var dStore : dStores.entrySet()) {
+                    Map<String, List<Integer>> filesToPorts = filesToSend.get(dStore.getKey()).stream().collect(Collectors.groupingBy(
+                                Map.Entry::getValue, Collectors.mapping(Map.Entry::getKey, Collectors.toList())));
+
+                    String filesToPortsString;
+                    if (filesToPorts.size() == 0) filesToPortsString = "0"; 
+                    else filesToPortsString = filesToPorts.size() + " " + filesToPorts.entrySet()
+                            .stream().map(e -> e.getKey() + " " + e.getValue().size() + " " + 
+                            String.join(" ", e.getValue().stream().map(Object::toString)
+                            .collect(Collectors.toUnmodifiableList()))).collect(Collectors.joining(" "));
+
+                    String message = "REBALANCE " + filesToPortsString + " " + filesToDelete.get(dStore.getKey()).size() + " " + String.join(" ", filesToDelete.get(dStore.getKey()));
+                    dStore.getValue().getDstore().sendMessage(message);
                 }
 
 
-                // while (!dStoreCopy.entrySet().stream()
-                //             .map(e -> e.getValue().stream().filter(f -> index.isStoreComplete(f)).collect(Collectors.toList()).size())
-                //             .allMatch(e -> (e >= Math.floor((replicationFactor * index.sizeCompleted())/(float)dStores.size())) 
-                //                 || (e >= Math.ceil((replicationFactor * index.sizeCompleted())/(float)dStores.size())))) {
-                //     ArrayList<Integer> dStoresSorted =  new ArrayList<>(dStoreCopy.keySet().stream()
-                //                 .sorted(Comparator.comparingInt(e -> dStoreCopy.get(e).size())).collect(Collectors.toList()));
-                //     var fileToMove = (dStoreCopy.get(dStoresSorted.get(dStoresSorted.size() - 1)))
-                //                     .stream().filter(e -> (dStoreCopy.get(dStoresSorted.get(0)).contains(e)))
-                //                     .limit(0).collect(Collectors.toList()).get(0);
-                //     //filesToDelete.
-                // }
             } catch (Exception e) {
                 logger.err("Error rebalancing");
+                e.printStackTrace();
             } finally {
                 logger.info("Rebalance complete");
                 rebalanceLock.writeLock().unlock();
             }
         }
 
-        public class attemptRemoveInProgress extends Thread {
-            String filename;
+        public class fixRemoveInProgress extends Thread {
+            private String filename;
 
-            public attemptRemoveInProgress(String filename) {
+            public fixRemoveInProgress(String filename) {
                 this.filename = filename;
             }
 
-            @Override
             public void run() {
-                ArrayList<Integer> dStoresWithFile = new ArrayList<>(dStores.entrySet().stream()
-                .filter(e -> e.getValue().getFiles().contains(filename))
-                .map(Map.Entry::getKey).collect(Collectors.toList()));
-                
-                if (dStoresWithFile.isEmpty()) index.remove(filename);
-                else {
-                    var ackQueue = new LinkedBlockingQueue<Integer>();
-                    awaitingRemoveAcks.put(filename, ackQueue);
-                    for (var dStorePort : dStoresWithFile) {
-                        dStores.get(dStorePort).getDstore().sendMessage("REMOVE " + filename);
-                    }
-                    if (waitForRemoveAcks(dStoresWithFile, filename, ackQueue)) {
-                        index.remove(filename);
-                    } 
-                    awaitingRemoveAcks.remove(filename);
+                ArrayList<Integer> dStoresWithFile = new ArrayList<>(dStores.entrySet().stream() // Get dStores
+                    .filter(e -> e.getValue().getFiles().contains(filename))
+                    .map(Map.Entry::getKey).collect(Collectors.toList()));
+                CountDownLatch latch = new CountDownLatch(dStoresWithFile.size());
+                awaitingRemove.put(filename, latch);
+                for (Integer dStorePort : dStoresWithFile) { // Send REMOVE messages
+                    dStores.get(dStorePort).getDstore().sendMessage("REMOVE " + filename);
                 } 
+                try {
+                    if (latch.await(timeout, TimeUnit.MILLISECONDS)) { // Wait for acks, with timeout
+                        index.remove(filename);
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                } finally {
+                    awaitingRemove.remove(filename);
+                }
             }
         }
     
@@ -238,8 +305,6 @@ public class Controller {
         //Reader and Writers
         private PrintWriter out;
         private BufferedReader in;
-
-        private BlockingQueue<Integer> ackQueue = new LinkedBlockingQueue<>();
 
         //Logger
         private static Logger logger = Logger.getLogger(ClientHandler.class.getName());
@@ -303,35 +368,30 @@ public class Controller {
         public void handleMessage(String message) { 
             logger.info("Message received from client, "+ socket.getPort() + ": " + message);
             try {
-                var operation = getOperation(message);
                 var arguments = message.split(" ");
 
-                if (operation.equals("LIST")) {
-                    list();
-                } else if (operation.equals("STORE")) {
-                    var filename = arguments[1];
-                    var filesize = Integer.parseInt(arguments[2]);
-
-                    store(filename, filesize);
-                } else if (operation.equals("LOAD")) {
-                    var filename = arguments[1];
-                    if (!attemptedLoad.isEmpty()) attemptedLoad.clear();
-                    load(filename);
-                    return;
-                } else if (operation.equals("RELOAD")) {
-                    var filename = arguments[1];
-
-                    load(filename);
-                    return;
+                switch (getOperation(message)) {
+                    case "LIST" -> list();
+                    case "STORE" -> {
+                        var filename = arguments[1];
+                        var filesize = Integer.parseInt(arguments[2]);
+                        store(filename, filesize); 
+                    }
+                    case "LOAD" -> {
+                        var filename = arguments[1];
+                        if (!attemptedLoad.isEmpty()) attemptedLoad.clear();
+                        load(filename);
+                    }
+                    case "RELOAD" -> {
+                        var filename = arguments[1];
+                        load(filename);
+                    }
+                    case "REMOVE" -> {
+                        var filename = arguments[1];
+                        remove(filename);
+                    }
+                    default -> logger.err("Malformed Message from client");
                 }
-                else if (operation.equals("REMOVE")) {
-                    var filename = arguments[1];
-
-                    remove(filename);
-                } else {
-                    logger.err("Malformed Message from client");
-                }
-                attemptedLoad.clear();
             } catch (Exception e) {
                 logger.err("Error in handling message");
                 e.printStackTrace();
@@ -367,6 +427,7 @@ public class Controller {
                 logger.err("FILE ALREADY EXISTS");
                 return;
             } 
+
             rebalanceLock.readLock().lock();
             index.put(filename, status.store_in_progress, filesize); // Add status to index, start processing
             statusCheckLock.unlock();
@@ -381,56 +442,30 @@ public class Controller {
                 String.join(" ",  dStoresToUse.stream().map(String::valueOf).collect(Collectors.toList()));
             
             //Put ack queue in array
-            awaitingStoreAcks.put(filename, ackQueue);
+            CountDownLatch latch = new CountDownLatch(dStoresToUse.size());
+            awaitingStore.put(filename, latch);
 
             logger.info("Storing to: " + toStore);
             out.println("STORE_TO " + toStore);
 
-            //Check for acks from dstores
-            if (waitForStoreAcks(new ArrayList<>(dStoresToUse), filename)) {
-                out.println(codes.store_complete.value);
-                index.setStatus(filename, status.store_complete);
-                for (Integer dStorePort : dStoresToUse) {
-                    dStores.get(dStorePort).getFiles().add(filename);
-                }
-            } else {
-                logger.err("Error Storing File");
-                index.remove(filename);
-            }
-            awaitingStoreAcks.remove(filename);
-            rebalanceLock.readLock().unlock();
-        }
-
-        public Boolean waitForStoreAcks(ArrayList<Integer> dStoresToUse, String filename) {
-            ExecutorService executor = Executors.newSingleThreadExecutor();
-            Future<Boolean> future = executor.submit(new storeAckWaiter(dStoresToUse, filename));
-
+            //Waiting for store acks (with latch)
             try {
-                return future.get(timeout, TimeUnit.MILLISECONDS);
+                if (latch.await(timeout, TimeUnit.MILLISECONDS)) {
+                    logger.info("File: '" + filename + "' stored");
+                    out.println(codes.store_complete.value);
+                    index.setStatus(filename, status.store_complete);
+                    dStoresToUse.forEach(e -> dStores.get(e).getFiles().add(filename));
+                } else {
+                    logger.err("Error storing file");
+                    index.remove(filename);
+                }
             } catch (Exception e) {
-                future.cancel(true);
-                return false;
+                e.printStackTrace();
             } finally {
-                executor.shutdown();
+                awaitingStore.remove(filename);
+                rebalanceLock.readLock().unlock();
             }
-        }
 
-        public class storeAckWaiter implements Callable<Boolean> {
-            ArrayList<Integer> dStoresToUse;
-            String filename;
-
-            public storeAckWaiter (ArrayList<Integer> dStoresToUse, String filename){
-                this.dStoresToUse = dStoresToUse;
-                this.filename = filename;
-            }
-            @Override
-            public Boolean call() throws InterruptedException {
-                while (true) {
-                    Integer dStoreAck = ackQueue.take();
-                    dStoresToUse.remove(dStoreAck);
-                    if (dStoresToUse.isEmpty()) return true;
-                }           
-            }
         }
 
         private void load(String filename) { // REMOVE MAY START WHEN LOAD IS IN PROGRESS?
@@ -439,7 +474,6 @@ public class Controller {
                 logger.err("NOT ENOUGH DSTORES");
                 return;
             }
-
 
             if (!index.getStatus(filename).equals(status.store_complete)) {
                 out.println(codes.error_file_does_not_exist.value);
@@ -477,6 +511,8 @@ public class Controller {
                 logger.err("ERROR FILE DOES NOT EXIST");
                 return;
             }
+            
+
             rebalanceLock.readLock().lock();
             index.setStatus(filename, status.remove_in_progress);  // Add status to index, start processing
             statusCheckLock.unlock();
@@ -487,56 +523,27 @@ public class Controller {
                                                 .map(Map.Entry::getKey)
                                                 .collect(Collectors.toList()));
             
-            awaitingRemoveAcks.put(filename, ackQueue);
+           
+            CountDownLatch latch = new CountDownLatch(dStoresWithFile.size());
+            awaitingRemove.put(filename, latch);
 
             for (Integer dStorePort : dStoresWithFile) {
                 dStores.get(dStorePort).getDstore().sendMessage("REMOVE " + filename);
             }      
-             
-            if (waitForRemoveAcks(dStoresWithFile, filename, ackQueue)) {
-                out.println(codes.remove_complete.value);
-                index.remove(filename);
-            } 
-            awaitingRemoveAcks.remove(filename);
-            rebalanceLock.readLock().unlock();
+
+            try {
+                if (latch.await(timeout, TimeUnit.MILLISECONDS)) {
+                    out.println(codes.remove_complete.value);
+                    index.remove(filename);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                awaitingRemove.remove(filename);
+                rebalanceLock.readLock().unlock();
+            }
         }
     }
-
-    public static Boolean waitForRemoveAcks(ArrayList<Integer> dStoresWithFile, String filename, BlockingQueue<Integer> queue) {
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        Future<Boolean> future = executor.submit(new removeAckWaiter(dStoresWithFile, filename, queue));
-
-        try {
-            return future.get(timeout, TimeUnit.MILLISECONDS);
-        } catch (Exception e) {
-            future.cancel(true);
-            return false;
-        } finally {
-            executor.shutdown();
-        }
-    }
-
-    public static class removeAckWaiter implements Callable<Boolean> {
-        ArrayList<Integer> dStoresWithFile;
-        String filename;
-        BlockingQueue<Integer> ackQueue;
-
-        public removeAckWaiter (ArrayList<Integer> dStoresWithFile, String filename, BlockingQueue<Integer> queue){
-            this.dStoresWithFile = dStoresWithFile;
-            this.filename = filename;
-            this.ackQueue = queue;
-        }
-        @Override
-        public Boolean call() throws InterruptedException {
-            while (true) {
-                Integer dStoreAck = ackQueue.take();
-                dStoresWithFile.remove(dStoreAck);
-                dStores.get(dStoreAck).getFiles().remove(filename);
-                if (dStoresWithFile.isEmpty()) return true;
-            }           
-        }
-    }
-
 
     private static class UnknownHandler extends Thread {
         private Socket socket;
@@ -559,22 +566,15 @@ public class Controller {
                     return;
                 }
 
-                String operation = getOperation(message);
-
-                if (operation.equals("JOIN")) {
-                    var arguments = message.split(" ");
-                    Integer port = Integer.parseInt(arguments[1]);
-                    new DstoreHandler(socket, port).start();
-                } else {
-                    ClientHandler t = new ClientHandler(socket, message);
-                    t.start();
-                    synchronized(t) {
-                        t.wait();
-                        Thread.sleep(1000);
-                        t.notify();
+                switch (getOperation(message)) {
+                    case "JOIN" -> {
+                        var arguments = message.split(" ");
+                        Integer port = Integer.parseInt(arguments[1]);
+                        new DstoreHandler(socket, port).start();
+                        new Thread(new Rebalance()).start();
                     }
+                    default -> new ClientHandler(socket, message).start();
                 }
-
             } catch (Exception e) {
                 logger.info("Unknown Connection Lost or Malformed Message");
                 e.printStackTrace();
@@ -626,7 +626,7 @@ public class Controller {
         }
 
         public void sendMessage(String message) {
-            out.println(message);;
+            out.println(message);
         }
 
         public void run() {
@@ -651,34 +651,44 @@ public class Controller {
                 dStores.remove(port);
                 closeConnection();
             }
-
         }
 
         public void handleMessage(String message) {
             logger.info("Message received from dStore, " + socket.getPort() + ": " + message);
             try {
-                var operation = getOperation(message);
                 var arguments = message.split(" ");
 
-                if (operation.equals("STORE_ACK")) {
-                    var filename = arguments[1];
-
-                    awaitingStoreAcks.get(filename).put(port);
-                } else if (operation.equals("REMOVE_ACK") || operation.equals("ERROR_FILE_DOES_NOT_EXIST")) {
-                    var filename = arguments[1];
-
-                    awaitingRemoveAcks.get(filename).put(port);
-                } else if (operation.equals("LIST")) {
-                    awaitingList.put(Map.entry(port, message.split(" ", 2)[1]));
+                switch (getOperation(message)) {
+                    case "STORE_ACK" -> {
+                        var filename = arguments[1];
+                        awaitingStore.get(filename).countDown();
+                    }
+                    case "REMOVE_ACK", "ERROR_FILE_DOES_NOT_EXIST" -> {
+                        var filename = arguments[1];
+                        dStores.get(port).getFiles().remove(filename); // Remove file from dstore file list
+                        awaitingRemove.get(filename).countDown();
+                    }
+                    case "LIST" -> awaitingList.put(Map.entry(port, message.split(" ", 2)[1]));
+                    default -> logger.err("Malformed Message from dstore");
                 }
+
+                // if (operation.equals("STORE_ACK")) {
+                //     var filename = arguments[1];
+
+                //     awaitingStore.get(filename).countDown();
+                // } else if (operation.equals("REMOVE_ACK") || operation.equals("ERROR_FILE_DOES_NOT_EXIST")) {
+                //     var filename = arguments[1];
+
+                //     dStores.get(port).getFiles().remove(filename); // Remove file from dstore file list
+                //     awaitingRemove.get(filename).countDown();
+                // } else if (operation.equals("LIST")) {
+                //     awaitingList.put(Map.entry(port, message.split(" ", 2)[1]));
+                // }
             } catch (Exception e) {
                 logger.err("Error in handling message");
             }
-
-
         }
     }
-
 
     private static String getOperation(String message) {
         return message.split(" ", 2)[0];

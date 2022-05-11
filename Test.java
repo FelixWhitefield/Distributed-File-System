@@ -1,19 +1,94 @@
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Collectors;
+
+import javax.xml.crypto.dsig.spec.HMACParameterSpec;
 
 public class Test {
     static ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     static ReentrantLock clock = new ReentrantLock();
 
+    
+
 
 
     public static void main(String[] args) {
-        
-        
-        
 
+        try {
+            System.out.println(Files.size(Paths.get("testfile")));
+        } catch (IOException e1) {
+            // TODO Auto-generated catch block
+            e1.printStackTrace();
+        }
+
+
+
+        ArrayList<List<String>> pttt = new ArrayList<>();
+        pttt.add(Arrays.asList("hello", "hi"));
+        pttt.add(Arrays.asList("hello"));
+        pttt.add(Arrays.asList("hello"));
+
+        System.out.println(pttt.stream().mapToInt(i -> i.size()).sum());
+
+
+        String test = "hello  asd asd   asd asd";
+        var arguments = test.split(" +");
+        for (String p : arguments) {
+            System.out.println(p);
+        }
+
+
+
+
+
+        ConcurrentHashMap<Integer, String> hmap = new ConcurrentHashMap<>();
+        hmap.put(123,"123");
+        hmap.put(1232,"123");
+        hmap.put(1234,"123");
+        hmap.put(1235,"123");
+        hmap.put(1236,"123");
+        hmap.put(12323,"123");
+        hmap.put(123123,"123");
+        hmap.put(1231231,"123");
+        hmap.put(1231231,"1223");
+
+        Map<String, List<Integer>> result = hmap.entrySet().stream().collect(Collectors.groupingBy(
+            Map.Entry::getValue, Collectors.mapping(Map.Entry::getKey, Collectors.toList())));
         
+        System.out.println(result);
+        
+        HashMap<String, Integer> map = new HashMap<>();
+        map.put("1", 1);
+        map.put("1", 1);
+        map.put("1", 1);
+        map.put("2", 2);
+
+        System.out.println(map.toString());
+
+        HashMap<Integer, String> dStores = new HashMap<>();
+        dStores.put(123,"hello");
+
+        HashMap<Integer, String> ht = new HashMap<>();
+        ht.put(123,"hello");
+        ht.put(321, "penis");
+        
+        List<Long> s = ht.entrySet().stream()
+        .map(f -> dStores.entrySet().stream()
+        .dropWhile(e -> !e.getValue().equals(f.getValue()))
+        .count()).collect(Collectors.toList());
+
+        System.out.println(s.toString());
 
 
 
