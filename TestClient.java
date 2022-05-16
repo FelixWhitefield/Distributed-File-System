@@ -13,11 +13,15 @@ public class TestClient {
             client.connect();
             System.out.println("Connected");
 
+            
+
             BufferedReader stdIn =
             new BufferedReader(
                 new InputStreamReader(System.in));
 
             File file = new File("testfile");
+
+            client.store(file);
 
             File file1 = new File ("testfile1");
 
@@ -38,6 +42,9 @@ public class TestClient {
                 for (var s : client.list()) {
                     System.out.println(s);
                 }
+
+                Thread.sleep(20000);
+                client.remove("testfile");
 
             }
         } catch (Exception e) {

@@ -1,17 +1,15 @@
 import java.text.SimpleDateFormat;
 import java.util.Date;
 
-import javax.swing.text.AttributeSet.ColorAttribute;
-import javax.swing.text.StyleConstants.ColorConstants;
-
 public class Logger {
-    private String caller;
+    private Class<?> caller;
 
-    public static Logger getLogger(String caller) {
+
+    public static Logger getLogger(Class<?> caller) {
         return new Logger(caller);
     }
 
-    public Logger(String caller) {
+    public Logger(Class<?> caller) {
         this.caller = caller;
     }
 
@@ -19,14 +17,20 @@ public class Logger {
         Date date = new Date();
         SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss");
 
-        System.out.println(sdf.format(date) + " | " + caller + " | Thread " + Thread.currentThread().getId() + " | " + "INFO | " + String.valueOf(message));
+        String callerName = caller.getCanonicalName();
+
+        System.out.println(sdf.format(date) + " | " + callerName + " | Thread " + Thread.currentThread().getId() + " | " + "INFO | " + String.valueOf(message));
     }
 
     public void err(Object message) {
         Date date = new Date();
         SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss");
-         
-        System.err.println(sdf.format(date) + " | " + caller + " | Thread " + Thread.currentThread().getId() + " | " + "ERROR | " + String.valueOf(message));
+
+        String callerName = caller.getCanonicalName();
+
+        System.err.print("\u001B[31m"); 
+        System.err.println(sdf.format(date) + " | " + callerName + " | Thread " + Thread.currentThread().getId() + " | " + "ERROR | " + String.valueOf(message));
+        System.err.print("\u001B[0m"); 
     }
     
 }

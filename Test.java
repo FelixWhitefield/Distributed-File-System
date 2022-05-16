@@ -8,11 +8,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
-
-import javax.xml.crypto.dsig.spec.HMACParameterSpec;
 
 public class Test {
     static ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
@@ -24,6 +23,15 @@ public class Test {
 
 
     public static void main(String[] args) {
+
+        System.out.println(Runtime.getRuntime().availableProcessors());
+
+
+
+        CountDownLatch latch = new CountDownLatch(2);
+        latch.countDown();
+        //latch.countDown();
+        System.out.println(latch.getCount());
 
         try {
             System.out.println(Files.size(Paths.get("testfile")));
