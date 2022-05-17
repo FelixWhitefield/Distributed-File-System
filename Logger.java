@@ -3,7 +3,7 @@ import java.util.Date;
 
 public class Logger {
     private Class<?> caller;
-
+    private SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss");
 
     public static Logger getLogger(Class<?> caller) {
         return new Logger(caller);
@@ -15,7 +15,6 @@ public class Logger {
 
     public void info(Object message) {
         Date date = new Date();
-        SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss");
 
         String callerName = caller.getCanonicalName();
 
@@ -24,13 +23,11 @@ public class Logger {
 
     public void err(Object message) {
         Date date = new Date();
-        SimpleDateFormat sdf = new SimpleDateFormat("HH:mm:ss");
 
         String callerName = caller.getCanonicalName();
 
-        System.err.print("\u001B[31m"); 
-        System.err.println(sdf.format(date) + " | " + callerName + " | Thread " + Thread.currentThread().getId() + " | " + "ERROR | " + String.valueOf(message));
-        System.err.print("\u001B[0m"); 
+        System.err.println("\u001B[31m" + sdf.format(date) + " | " + callerName + " | Thread " 
+            + Thread.currentThread().getId() + " | " + "ERROR | " + String.valueOf(message) + "\u001B[0m");
     }
     
 }

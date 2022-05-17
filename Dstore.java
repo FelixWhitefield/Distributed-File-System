@@ -11,11 +11,12 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Callable;
-import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import java.io.PrintWriter;
 import java.net.InetAddress;
@@ -34,6 +35,9 @@ public class Dstore {
     //Cnontroller Handler
     private static ControllerHandler controllerHandler;
 
+    //Client Thread pool
+    private static ExecutorService taskPool = Executors.newCachedThreadPool();
+
     public static void main(String[] args) {
         try { //Parse inputs
             port = Integer.parseInt(args[0]);
@@ -47,36 +51,33 @@ public class Dstore {
 
         try { // Clear Folder Contents
             Path folderPath = Paths.get(fileFolder);
-            logger.info("Cleaning folder contents for: " + folderPath.toAbsolutePath().toString());
+            logger.info("Cleaning folder contents: " + folderPath.toAbsolutePath().toString());
             if (Files.exists(folderPath)) 
                 Files.walk(folderPath)
-                    .sorted(Comparator.reverseOrder())
-                    .map(Path::toFile)
-                    .forEach(File::delete);
+                     .sorted(Comparator.reverseOrder())
+                     .map(Path::toFile)
+                     .forEach(File::delete);
             Files.createDirectory(folderPath);
         } catch (IOException e) {
-            logger.err("Error cleaning folder '" + fileFolder + "'' contents");
-            e.printStackTrace();
+            logger.err("Error cleaning folder: '" + fileFolder + "''");
             return;
         }
 
         try { // Connect To The Controller
             connectToController();
         } catch (Exception e) {
-            logger.err("Error connecting to server");
-            e.printStackTrace();
+            logger.err("Error connecting to controller");
             return;
         }
 
-        acceptConnections(); // Accept Connections From Clients and Dstores
+        acceptConnections(); // Accept Connections From Clients and other Dstores
     }
 
     public static void connectToController() throws UnknownHostException, IOException {
         Socket socket = new Socket(InetAddress.getLocalHost(), cport);
-        logger.info("Connected to Controller");
 
         controllerHandler = new ControllerHandler(socket);
-        controllerHandler.start();
+        new Thread(controllerHandler).start();
     }
 
     public static void acceptConnections() {
@@ -85,17 +86,15 @@ public class Dstore {
             for (;;) {
                 try {
                     Socket client = serverSocket.accept();
-                    client.setSoTimeout(timeout);
-                    new ClientHandler(client).start();
+                    taskPool.execute(new ClientHandler(client));
                 } catch (IOException e) { logger.err("Error Creating Client"); }
             }
         } catch (IOException e) {
             logger.err("Error Accepting Connections - Clients can no longer connect");
-            e.printStackTrace();
         }
     }
 
-    private static class ClientHandler extends Thread {
+    private static class ClientHandler implements Runnable {
         private final Socket socket;
         private final PrintWriter out;
         private final BufferedReader in;
@@ -107,107 +106,66 @@ public class Dstore {
             this.socket = socket;
             this.out = new PrintWriter(socket.getOutputStream(), true);
             this.in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+
+            socket.setSoTimeout(timeout);
             logger.info("New Client Created");
         }
 
         public void run() {
             try (socket; out; in) {
-                while(!socket.isClosed()) {
-                    String message = in.readLine();
-                    if (message == null) {
-                        return;
-                    }
-                    handleMessage(message);
-                }
-            } catch (Exception e) {
-                e.printStackTrace();
-            } 
-        }
-
-        public void handleMessage(String message) {
-            logger.info("Message received from client, " + socket.getPort() + ": " + message);
-
-            try {
-                var arguments = message.split(" ");
-
-                switch (getOperation(message)) {
-                    case Protocol.STORE -> {
-                        var filename = arguments[1];
-                        var filesize = Integer.parseInt(arguments[2]);
-                        out.println(Protocol.ACK); // Notify client message received
-                        store(filename, filesize);
-                    }
-                    case Protocol.LOAD_DATA -> {
-                        var filename = arguments[1];
-                        load(filename);
-                    }
-                    case Protocol.REBALANCE_STORE -> {
-                        var filename = arguments[1];
-                        var filesize = Integer.parseInt(arguments[2]);
-                        out.println(Protocol.ACK); // Notify dstore message received
-                        rebalanceStore(filename, filesize);
-                    }
-                    default -> logger.err("Malformed message");
-                }
-            } catch (Exception e) {
-                logger.err("Error in handling message");
+                String message;
+                if ((message = in.readLine()) != null) handleMessage(message);
+            } catch (Exception e) { } finally {
+                logger.info("Client Disconnected");
             }
         }
 
-        public void rebalanceStore(String filename, Integer filesize) {
+        public void handleMessage(String message) {
             try {
-                //Get data from dstore
-                byte[] data = new byte[filesize];
-                socket.getInputStream().readNBytes(data, 0, filesize);
-
-                //Store data in folder
-                Path path = Paths.get(fileFolder, filename);
-                Files.write(path, data);
-
-                logger.info("Store of file '" + filename + "' complete");
-                socket.close();
+                var arguments = message.split(" ");
+                switch (getOperation(message)) {
+                    case Protocol.STORE     -> store(arguments[1], Integer.parseInt(arguments[2]), false);
+                    case Protocol.LOAD_DATA -> load(arguments[1]);
+                    case Protocol.REBALANCE_STORE -> store(arguments[1], Integer.parseInt(arguments[2]), true);
+                    default -> logger.err("Malformed client message: '" + message + "'");
+                }
             } catch (Exception e) {
-                e.printStackTrace();
-                logger.err("Error in storing file");
-            } 
+                logger.err("Error handling client/dstore message: '" + message + "'");
+            }
         }
 
-        public void store(String filename, Integer filesize) {
+        public void store(String filename, Integer filesize, Boolean isRebalance) {
+            logger.info("Store operation started for file: '" + filename + "'");
+            out.println(Protocol.ACK); // Notify client message received
             try {
-                //Get data from client
-                byte[] data = new byte[filesize];
-                socket.getInputStream().readNBytes(data, 0, filesize);
+                byte[] data = new byte[filesize];  //Get data from client
+                socket.getInputStream().readNBytes(data, 0, filesize); 
 
-                //Store data in folder
-                Path path = Paths.get(fileFolder, filename);
+                Path path = Paths.get(fileFolder, filename); //Store file in folder
                 Files.write(path, data);
 
-                controllerHandler.sendMessage(Protocol.STORE_ACK + " " + filename); // Notify Controller store complete
+                if (!isRebalance) controllerHandler.sendMessage(Protocol.STORE_ACK + " " + filename); // Notify Controller store complete
                 logger.info("Store of file '" + filename + "' complete");
             } catch (Exception e) {
-                e.printStackTrace();
-                logger.err("Error in storing file");
+                logger.err("Error storing file: '" + filename + "'");
             } 
         }
 
         public void load(String filename) {
+            logger.info("Load operation started for file: '" + filename + "'");
             try {
                 Path path = Paths.get(fileFolder, filename);
-                if (!Files.exists(path)) { // Check if it exists
-                    socket.close();
-                    return;
-                }
+                if (!Files.exists(path)) return; // If file doesn't exist
                 byte[] data = Files.readAllBytes(path);
                 socket.getOutputStream().write(data);
+                logger.info("Load of file '" + filename + "' complete");
             } catch (Exception e) {
-                e.printStackTrace();
-                logger.err("Error in loading file");
+                logger.err("Error loading file: " + filename + "'");
             }
         }
     }
 
-
-    private static class ControllerHandler extends Thread {
+    private static class ControllerHandler implements Runnable {
         private final Socket socket;
         private final PrintWriter cout;
         private final BufferedReader cin;
@@ -220,6 +178,7 @@ public class Dstore {
             this.cin = new BufferedReader(new InputStreamReader(socket.getInputStream()));
 
             cout.println("JOIN " + port);
+            logger.info("Connected to Controller");
         }
 
         public void sendMessage(String message) {
@@ -228,18 +187,9 @@ public class Dstore {
 
         public void run() {
             try (socket; cin; cout) {
-                while (true) {
-                    String message = cin.readLine();
-                    if (message == null) {
-                        return;
-                    }
-
-                    logger.info("Message Received From Controller: " + message);
-                    handleMessage(message);
-                }
-            } catch (Exception e) {
-                logger.err("Error Reading Message");
-            } finally { 
+                String message;
+                while ((message = cin.readLine()) != null) handleMessage(message);
+            } catch (Exception e) { } finally { 
                 logger.info("Server connection offline");
                 System.exit(0);
             }
@@ -248,13 +198,9 @@ public class Dstore {
         public void handleMessage(String message) {
             try {
                 var arguments = message.split(" ");
-
                 switch (getOperation(message)) {
-                    case Protocol.LIST -> list();
-                    case Protocol.REMOVE -> {
-                        var filename = arguments[1];
-                        remove(filename);   
-                    }
+                    case Protocol.LIST   -> list();
+                    case Protocol.REMOVE -> remove(arguments[1]);   
                     case Protocol.REBALANCE -> {
                         var rebal = Arrays.asList(arguments);
                         HashMap<String, Set<Integer>> filesToSend = new HashMap<>();
@@ -263,80 +209,77 @@ public class Dstore {
                         iter.next();
                         // Get values from message
                         var noOfFiles = Integer.parseInt(iter.next());
-                        for (int i = 0; i < noOfFiles; i++) {
+                        IntStream.range(0, noOfFiles).forEach(i -> { 
                             var filename = iter.next();
                             var noOfPorts = Integer.parseInt(iter.next());
                             Set<Integer> ports = new HashSet<>();
-                            for (int j = 0; j < noOfPorts; j++) {
-                                ports.add(Integer.parseInt(iter.next()));
-                            }
+                            IntStream.range(0, noOfPorts).forEach(j -> ports.add(Integer.parseInt(iter.next())));
                             filesToSend.put(filename, ports);
-                        }
+                        });
                         var noOfFilesDelete = Integer.parseInt(iter.next());
-                        for (int i = 0; i < noOfFilesDelete; i ++) {
-                            filesToDelete.add(iter.next());
-                        }
+                        IntStream.range(0, noOfFilesDelete).forEach(i -> filesToDelete.add(iter.next()));
                         rebalance(filesToSend, filesToDelete);
                     }
-                    default -> logger.err("Malformed Message");
+                    default -> logger.err("Malformed controller message: '" + message + "'");
                 }
             } catch (Exception e) {
-                e.printStackTrace();
-                logger.err("Error handling message");
+                logger.err("Error handling controller message");
             } 
         }
 
         public void list() {
+            logger.info("List operation started");
             try (Stream<Path> stream = Files.list(Paths.get(fileFolder))) {
                 var files = String.join(" ", stream.filter(file -> !Files.isDirectory(file))
                             .map(Path::getFileName)
                             .map(Path::toString)
                             .collect(Collectors.toList()));
-                cout.println(Protocol.LIST + " " + files);                
-            } catch (Exception e) {}
+                cout.println((files.length() == 0) ? Protocol.LIST : Protocol.LIST + " " + files);    
+                logger.info("List complete");         
+            } catch (Exception e) {
+                logger.err("Error in list operation");
+            }
         }
 
         public void remove(String filename) {
-            logger.info("Removing file: " + filename);
-
+            logger.info("Remove operation started for: '" + filename + "'");
             Path path = Paths.get(fileFolder, filename);
             try {
                 if (Files.deleteIfExists(path)) cout.println(Protocol.REMOVE_ACK + " " + filename);
                 else cout.println(Protocol.ERROR_FILE_DOES_NOT_EXIST + " " + filename);
+                logger.info("Removal of file: '" + filename + "' complete");
             } catch (IOException e) {
-                logger.err("Error deleting file: " + filename);
+                logger.err("Error removing file: " + filename);
             }
         }
 
         public void rebalance(HashMap<String, Set<Integer>> filesToSend, ArrayList<String> filesToDelete) {
-            ForkJoinPool pool = ForkJoinPool.commonPool();
-            List<SendFile> allFilesSend = new ArrayList<>();
+            logger.info("Rebalance operation started");
+            Set<SendFile> allFilesSend = new HashSet<>();
 
             filesToSend.entrySet().stream().forEach(e -> {
                 Integer filesize;
-                try {
-                    filesize = (int) Files.size(Paths.get(fileFolder, e.getKey()));
+                try { filesize = (int) Files.size(Paths.get(fileFolder, e.getKey()));
                 } catch (Exception e1) { return; }
                 e.getValue().forEach(p -> {
                     allFilesSend.add(new SendFile(e.getKey(), p, filesize));
                 });
             });
             try {
-                var results = pool.invokeAll(allFilesSend);
+                var results = taskPool.invokeAll(allFilesSend);
                 var allSuccessful = results.stream().allMatch(e -> {
-                    try {
-                        return e.get();
+                    try { return e.get();
                     } catch (Exception ex) { return false; }
                 });
                 if (!allSuccessful) return;
             } catch (Exception e1) { return; }
 
             filesToDelete.forEach(f -> {
-                try {
-                    Files.deleteIfExists(Paths.get(fileFolder, f));
+                try { Files.deleteIfExists(Paths.get(fileFolder, f));
                 } catch (Exception e) { return; }
             });
             cout.println(Protocol.REBALANCE_COMPLETE);
+            logger.info("Rebalance operation complete");
         }
 
         public static class SendFile implements Callable<Boolean> {
@@ -357,17 +300,17 @@ public class Dstore {
                     PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
                     BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 ) {
+                    logger.info("Sending '" + filename + "' to: " + port);
                     socket.setSoTimeout(timeout);
     
                     out.println(Protocol.REBALANCE_STORE + " " + filename + " " + filesize);
                     if (in.readLine().equals(Protocol.ACK)) {
                         byte[] data = Files.readAllBytes(Paths.get(fileFolder, filename));
                         socket.getOutputStream().write(data);
-                        logger.info("'" + filename + "' sent to: " + port);
                         return true;
                     } 
-                } catch (IOException e) { 
-                    e.printStackTrace();
+                } catch (Exception e) { 
+                    logger.err("Error sending '" + filename + "' to: " + port);
                 } 
                 return false;
             }
@@ -376,6 +319,5 @@ public class Dstore {
 
     private static String getOperation(String message) {
         return message.split(" ", 2)[0];
-    }
-    
+    }    
 }
