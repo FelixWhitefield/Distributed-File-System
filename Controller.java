@@ -1,7 +1,6 @@
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
@@ -14,6 +13,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.Map.Entry;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -59,7 +59,7 @@ public class Controller {
     private static final Logger logger = Logger.getLogger(Controller.class);
 
     public static void main(String[] args) {
-        try {
+        try { // Parse inputs
             cport = Integer.parseInt(args[0]);
             replicationFactor = Integer.parseInt(args[1]); 
             timeout = Integer.parseInt(args[2]); //ms
@@ -68,12 +68,13 @@ public class Controller {
             logger.err("Malformed arguemnts; java Controller cport R timeout rebalance_period");
             return;
         }
-        if (!(replicationFactor > 0 && timeout > 0 && rebalancePeriod > 0)) {
+
+        if (!(replicationFactor > 0 && timeout > 0 && rebalancePeriod > 0)) { // Check arguments
             logger.err("Arguments must be > 0");
             return;
         }
 
-        rebalanceTask = scheduler.schedule(new Rebalance(), rebalancePeriod, TimeUnit.SECONDS);
+        rebalanceTask = scheduler.schedule(new Rebalance(), rebalancePeriod, TimeUnit.SECONDS); // Rebal task
         acceptConnections(); // Accept Client/Dstore connections
     }
 
@@ -82,8 +83,8 @@ public class Controller {
         try (ServerSocket serverSocket = new ServerSocket(cport)) {
             for (;;) {
                 try {
-                    Socket client = serverSocket.accept();
-                    new Thread(new UnknownHandler(client)).start(); 
+                    Socket socket = serverSocket.accept();
+                    new Thread(new UnknownHandler(socket)).start(); 
                 } catch (IOException e) { logger.err("Error Creating Client"); }
             }
         } catch (IOException e) {
@@ -92,7 +93,6 @@ public class Controller {
     }
 
     public static class Rebalance implements Runnable {
-
         @Override
         public void run() {
             try {
@@ -112,33 +112,26 @@ public class Controller {
             dStores.values().forEach(dStore ->  dStore.getDstore().sendMessage(Protocol.LIST));
             try {
                 awaitingList.await(timeout, TimeUnit.MILLISECONDS);
-            } catch (Exception e) { return; } finally {
+            } catch (Exception e) { } finally {
                 awaitingList = null;
             }
-            var aliveDstores = dStoreListFiles.keySet();
+            var aliveDstores = dStoreListFiles.keySet(); // The dstores which responded
             if (aliveDstores.size() < replicationFactor) {
                 logger.err("Cannot Rebalance - NOT ENOUGH DSTORES RESPONDED TO LIST");
                 return;
             }
-
-            //COMPARE FILES FROM DSTORE TO FILES LIST THAT CONTROLLER HAS
-            HashMap<Integer, Set<String>> extraFiles = new HashMap<>(); // Extra files the dstores have (not in controller's list)
-            dStoreListFiles.entrySet().stream().forEach(e -> extraFiles.put(e.getKey(), 
-                e.getValue().stream().filter(f -> dStores.get(e.getKey()).getFiles().contains(f)).collect(Collectors.toSet())));
             
             // Remove missing files from dStores List
-            dStoreListFiles.entrySet().stream().forEach(d -> dStores.get(d.getKey()).getFiles().removeIf(f -> !dStoreListFiles.get(d.getKey()).contains(f)));
+            dStoreListFiles.keySet().stream().forEach(k -> dStores.get(k).getFiles()
+                .removeIf(f -> !dStoreListFiles.get(k).contains(f)));
 
             index.keySet().stream().forEach(f -> { // Remove files which no dstore has
                 if (!dStores.values().stream().anyMatch(e -> e.getFiles().contains(f))) index.remove(f);
             });
 
             // Attempt to fix remove in progress files
-            var filesRemovingInProgress = index.entrySet().stream()
-                .filter(e -> Objects.equals(e.getValue().getStatus(), Status.remove_in_progress))
-                .map(Map.Entry::getKey).collect(Collectors.toList());
-
-            filesRemovingInProgress.stream().forEach(f -> taskPool.execute(new fixRemoveInProgress(f)));
+            index.keySet().stream().filter(k -> index.getStatus(k).equals(Status.remove_in_progress))
+                .forEach(f -> taskPool.execute(new fixRemoveInProgress(f)));
 
             //Rebalance now
             HashMap<Integer, Set<Entry<Integer, String>>> filesToSend = new HashMap<>();
@@ -147,25 +140,25 @@ public class Controller {
             aliveDstores.stream().forEach(p -> dStoresCopy.put(p, dStores.get(p).getFiles().stream()
                 .filter(f -> index.getStatus(f).equals(Status.store_complete)).collect(Collectors.toSet())));
         
-            dStoresCopy.keySet().stream().forEach(e -> {
-                filesToSend.put(e, new HashSet<>()); filesToRemove.put(e, new ArrayList<>());
+            dStoresCopy.keySet().stream().forEach(k -> {
+                filesToSend.put(k, new HashSet<>()); filesToRemove.put(k, new ArrayList<>());
             });
 
             var noChanges = true;
             //ENSURE FILE IS REPLICATED R TIMES
             for (var filename : index.keySet().stream().filter(f -> index.isStoreComplete(f)).collect(Collectors.toSet())) { // Check stored each file
-                Integer copies = dStoresCopy.entrySet().stream()
-                    .filter(e -> e.getValue().contains(filename))
-                    .collect(Collectors.toList()).size();
-                while (!copies.equals(replicationFactor) && copies > 0) { // If copies is not equal to R
-                    if (copies > replicationFactor) { // If there are more copies than R
+                Callable<Integer> copies = () -> (int) dStoresCopy.entrySet().stream()
+                                                .filter(e -> e.getValue().contains(filename)).count();
+
+                while (!copies.call().equals(replicationFactor) && copies.call() > 0) { // If copies is not equal to R
+                    if (copies.call() > replicationFactor) { // If there are more copies than R
                         Integer dStoreToRemove = 
                             (dStoresCopy.entrySet().stream().filter(e -> e.getValue().contains(filename))
                             .sorted(Comparator.comparing(e -> dStoresCopy.get(e.getKey()).size(), Comparator.reverseOrder()))
                             .collect(Collectors.toList())).get(0).getKey();
                         dStoresCopy.get(dStoreToRemove).remove(filename);
                         filesToRemove.get(dStoreToRemove).add(filename);
-                    } else if (copies < replicationFactor) { // If there are less copies than R
+                    } else if (copies.call() < replicationFactor) { // If there are less copies than R
                         Integer dStoreToReceive = 
                             (dStoresCopy.entrySet().stream().filter(e -> !e.getValue().contains(filename))
                             .sorted(Comparator.comparingInt(e -> dStoresCopy.get(e.getKey()).size()))
@@ -177,42 +170,33 @@ public class Controller {
                         dStoresCopy.get(dStoreToReceive).add(filename);
                         filesToSend.get(dStoreToGet).add(Map.entry(dStoreToReceive, filename));
                     }
-                    copies = dStoresCopy.entrySet().stream()
-                        .filter(e -> e.getValue().contains(filename))
-                        .collect(Collectors.toList()).size();
                     noChanges = false;
                 } 
             }
 
             //ENSURE DSTORES HAVE FILES EVENLY SPREAD
-            Boolean balanced = dStoresCopy.entrySet().stream()
-                .map(e -> e.getValue().stream().filter(f -> index.isStoreComplete(f)).collect(Collectors.toList()).size())
+            Callable<Boolean> balanced = () -> dStoresCopy.entrySet().stream()
+                .map(e -> e.getValue().size())
                 .allMatch(e -> (e >= Math.floor((replicationFactor * index.sizeCompleted())/(float)dStoresCopy.size())) 
-                    || (e >= Math.ceil((replicationFactor * index.sizeCompleted())/(float)dStoresCopy.size())));
+                    || (e >= Math.ceil((replicationFactor * index.sizeCompleted())/(float)dStoresCopy.size()))); 
 
-            if (balanced && noChanges) {
+            if (balanced.call() && noChanges) {
                 logger.info("Files are already balanced - No messages to send"); return;
             }
 
-            while (!balanced) {
+            while (!balanced.call()) {
                 ArrayList<Integer> dStoresSorted = new ArrayList<>(dStoresCopy.keySet().stream()
                     .sorted(Comparator.comparingInt(e -> dStoresCopy.get(e).size()))
                     .collect(Collectors.toList()));
                 Integer dStoreToReceive = dStoresSorted.get(0);
                 Integer dStoreToSend = dStoresSorted.get(dStoresSorted.size() - 1);
                 String fileToMove = dStoresCopy.get(dStoreToSend).stream()
-                    .filter(f -> !dStoresCopy.get(dStoreToReceive).contains(f))
-                    .collect(Collectors.toList()).get(0);
+                    .filter(f -> !dStoresCopy.get(dStoreToReceive).contains(f)).findFirst().orElse(null);
 
                 filesToSend.get(dStoreToSend).add(Map.entry(dStoreToReceive, fileToMove));
                 filesToRemove.get(dStoreToSend).add(fileToMove);
                 dStoresCopy.get(dStoreToSend).remove(fileToMove);
                 dStoresCopy.get(dStoreToReceive).add(fileToMove);
-
-                balanced = dStoresCopy.entrySet().stream()
-                    .map(e -> e.getValue().stream().filter(f -> index.isStoreComplete(f)).collect(Collectors.toList()).size())
-                    .allMatch(e -> (e >= Math.floor((replicationFactor * index.sizeCompleted())/(float)dStoresCopy.size())) 
-                        || (e >= Math.ceil((replicationFactor * index.sizeCompleted())/(float)dStoresCopy.size())));
             }
 
             // SEND MESSAGES :)
@@ -257,7 +241,7 @@ public class Controller {
         }
 
         public class fixRemoveInProgress implements Runnable {
-            private String filename;
+            private final String filename;
 
             public fixRemoveInProgress(String filename) {
                 this.filename = filename;
@@ -282,22 +266,14 @@ public class Controller {
         }
     }
     
-    private static class ClientHandler implements Runnable {
-        private final Socket socket;
-
-        //Reader and Writers
-        private final PrintWriter out;
-        private final BufferedReader in;
-
-        private Set<Integer> attemptedLoad = new HashSet<>();
+    private static class ClientHandler extends ConnectionHandler {
+        private final Set<Integer> attemptedLoad = new HashSet<>();
 
         //Logger
-        private static Logger logger = Logger.getLogger(ClientHandler.class);
+        private static final Logger logger = Logger.getLogger(ClientHandler.class);
 
         public ClientHandler(Socket socket, String message) throws IOException {
-            this.socket = socket;
-            this.out = new PrintWriter(socket.getOutputStream(), true);
-            this.in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            super(socket);
            
             logger.info("New Client Created");
             handleMessage(message);
@@ -334,10 +310,9 @@ public class Controller {
                 logger.err("LIST - NOT ENOUGH DSTORES");
                 return;
             }
-            String files = String.join(" ", index.entrySet() // Only list the stored files
-                    .stream()
-                    .filter(e -> Objects.equals(e.getValue().getStatus(), Status.store_complete))
-                    .map(Map.Entry::getKey)
+            logger.info("List operation started..");
+            String files = String.join(" ", index.keySet() // Only list the stored files
+                    .stream().filter(f -> index.isStoreComplete(f))
                     .collect(Collectors.toSet()));
             out.println((files.length() == 0) ? Protocol.LIST : Protocol.LIST + " " + files);
             logger.info("List operation complete");
@@ -356,15 +331,14 @@ public class Controller {
                 storeStatusLock.unlock();
                 return;
             }
-            logger.info("Store operation started for file: '" + filename + "'");
+            logger.info("Store operation started for file: '" + filename + "'..");
             rebalanceLock.readLock().lock();
             index.put(filename, Status.store_in_progress, filesize); // Add status to index, start processing
             storeStatusLock.unlock();
 
-            ArrayList<Integer> dStoresToUse = 
-                    new ArrayList<>(dStores.keySet().stream()
-                    .sorted(Comparator.comparingInt(e -> dStores.get(e).getFiles().size()))
-                    .limit(replicationFactor).collect(Collectors.toList()));
+            List<Integer> dStoresToUse =  dStores.keySet().stream()
+                        .sorted(Comparator.comparingInt(e -> dStores.get(e).getFiles().size()))
+                        .limit(replicationFactor).collect(Collectors.toList());
 
             String toStore = String.join(" ",  
                 dStoresToUse.stream().map(String::valueOf).collect(Collectors.toList()));
@@ -378,8 +352,8 @@ public class Controller {
 
             try { //Waiting for store acks (with latch)
                 if (latch.await(timeout, TimeUnit.MILLISECONDS)) {
-                    index.setStatus(filename, Status.store_complete);
                     dStoresToUse.forEach(e -> dStores.get(e).getFiles().add(filename));
+                    index.setStatus(filename, Status.store_complete);
                     out.println(Protocol.STORE_COMPLETE);
                     logger.info("Store of file '" + filename + "' complete");
                 } else {
@@ -387,7 +361,7 @@ public class Controller {
                     index.remove(filename);
                 }
             } catch (Exception e) {
-                logger.err("Error waiting for store acks: '" + filename + "'");
+                logger.err("Error completing store for: '" + filename + "'");
             } finally {
                 awaitingStore.remove(filename);
                 rebalanceLock.readLock().unlock();
@@ -406,12 +380,11 @@ public class Controller {
                 logger.err("REMOVE - ERROR FILE DOES NOT EXIST");
                 return;
             } 
-            logger.info("Load operation started for file: '" + filename + "'");
+            logger.info("Load operation started for file: '" + filename + "'..");
 
             List<Integer> dStoresWithFile = dStores.entrySet().stream()
-                                                   .filter(e -> e.getValue().getFiles().contains(filename))
-                                                   .map(Map.Entry::getKey)
-                                                   .collect(Collectors.toList());
+                                    .filter(e -> e.getValue().getFiles().contains(filename))
+                                    .map(Map.Entry::getKey).collect(Collectors.toList());
 
             dStoresWithFile.removeAll(attemptedLoad);
             if (dStoresWithFile.isEmpty()) {
@@ -438,15 +411,15 @@ public class Controller {
                 removeStatusLock.unlock();
                 return;
             }
-            logger.info("Remove operation started for: '" + filename + "'");
+            logger.info("Remove operation started for: '" + filename + "'..");
             rebalanceLock.readLock().lock();
             index.setStatus(filename, Status.remove_in_progress);  // Add status to index, start processing
             removeStatusLock.unlock();
 
-            Set<Integer> dStoresWithFile = new HashSet<>(dStores.entrySet().stream()
+            Set<Integer> dStoresWithFile = dStores.entrySet().stream()
                                                 .filter(e -> e.getValue().getFiles().contains(filename))
                                                 .map(Map.Entry::getKey)
-                                                .collect(Collectors.toSet()));
+                                                .collect(Collectors.toSet());
             
             CountDownLatch latch = new CountDownLatch(dStoresWithFile.size());
             awaitingRemove.put(filename, latch);
@@ -475,7 +448,7 @@ public class Controller {
         private final Socket socket;
 
         //Logger
-        private static Logger logger = Logger.getLogger(UnknownHandler.class);
+        private static final Logger logger = Logger.getLogger(UnknownHandler.class);
 
         public UnknownHandler(Socket socket) {
             this.socket = socket;
@@ -497,22 +470,14 @@ public class Controller {
         }
     }
 
-    private static class DstoreHandler implements Runnable {
-        private final Socket socket;
-
-        //Reader and Writers
-        private final PrintWriter out;
-        private final BufferedReader in;
-                
-        private Integer port;
+    private static class DstoreHandler extends ConnectionHandler {  
+        private final Integer port;
 
         //Logger
-        private static Logger logger = Logger.getLogger(DstoreHandler.class);
+        private static final Logger logger = Logger.getLogger(DstoreHandler.class);
 
         public DstoreHandler(Socket socket, Integer port) throws IOException {
-            this.socket = socket;
-            this.out = new PrintWriter(socket.getOutputStream(), true);
-            this.in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            super(socket);
             this.port = port;
             
             dStores.put(port, new DstoreAndFiles(this));
@@ -565,8 +530,8 @@ public class Controller {
         return message.split(" ", 2)[0];
     }
 
-    public static class DstoreAndFiles {
-        private DstoreHandler dStore;
+    private static class DstoreAndFiles {
+        private final DstoreHandler dStore;
         private Set<String> files;
 
         public DstoreAndFiles (DstoreHandler dStore) {
@@ -587,8 +552,8 @@ public class Controller {
         }
     }
     
-    public static class Index {
-        private ConcurrentHashMap<String, FileInfo> index;
+    private static class Index {
+        private final ConcurrentHashMap<String, FileInfo> index;
 
         public Index () {
             index = new ConcurrentHashMap<>();
@@ -638,9 +603,9 @@ public class Controller {
         }
     }
 
-    public static class FileInfo {
+    private static class FileInfo {
         private Status status;
-        private Integer filesize;
+        private final Integer filesize;
 
         public FileInfo (Status status, Integer filesize) {
             this.status = status;

@@ -24,25 +24,23 @@ import java.net.ServerSocket;
 import java.io.InputStreamReader;
 
 public class Dstore {
-    private static int port;
-    private static int cport;
-    private static int timeout;
+    private static Integer port, cport, timeout;
     private static String fileFolder;
 
     //Logger
-    private static Logger logger = Logger.getLogger(Dstore.class);
+    private static final Logger logger = Logger.getLogger(Dstore.class);
 
     //Cnontroller Handler
     private static ControllerHandler controllerHandler;
 
-    //Client Thread pool
+    //Task Thread pool
     private static ExecutorService taskPool = Executors.newCachedThreadPool();
 
     public static void main(String[] args) {
         try { //Parse inputs
             port = Integer.parseInt(args[0]);
-            cport = Integer.parseInt(args[1]);
-            timeout = Integer.parseInt(args[2]);
+            cport = Integer.parseInt(args[1]); 
+            timeout = Integer.parseInt(args[2]); //ms
             fileFolder = args[3];
         } catch (Exception e) {
             logger.err("Malformed arguemnts; java Dstore port cport timeout file_folder");
@@ -73,20 +71,20 @@ public class Dstore {
         acceptConnections(); // Accept Connections From Clients and other Dstores
     }
 
-    public static void connectToController() throws UnknownHostException, IOException {
+    private static void connectToController() throws UnknownHostException, IOException {
         Socket socket = new Socket(InetAddress.getLocalHost(), cport);
 
         controllerHandler = new ControllerHandler(socket);
         new Thread(controllerHandler).start();
     }
 
-    public static void acceptConnections() {
+    private static void acceptConnections() {
         logger.info("Accepting connections");
         try (ServerSocket serverSocket = new ServerSocket(port)) {
             for (;;) {
                 try {
-                    Socket client = serverSocket.accept();
-                    taskPool.execute(new ClientHandler(client));
+                    Socket socket = serverSocket.accept();
+                    taskPool.execute(new ClientHandler(socket));
                 } catch (IOException e) { logger.err("Error Creating Client"); }
             }
         } catch (IOException e) {
@@ -94,18 +92,12 @@ public class Dstore {
         }
     }
 
-    private static class ClientHandler implements Runnable {
-        private final Socket socket;
-        private final PrintWriter out;
-        private final BufferedReader in;
-
+    private static class ClientHandler extends ConnectionHandler {
         //Logger
-        private static Logger logger = Logger.getLogger(ClientHandler.class);
+        private static final Logger logger = Logger.getLogger(ClientHandler.class);
         
         public ClientHandler(Socket socket) throws IOException {
-            this.socket = socket;
-            this.out = new PrintWriter(socket.getOutputStream(), true);
-            this.in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            super(socket);
 
             socket.setSoTimeout(timeout);
             logger.info("New Client Created");
@@ -120,7 +112,7 @@ public class Dstore {
             }
         }
 
-        public void handleMessage(String message) {
+        private void handleMessage(String message) {
             try {
                 var arguments = message.split(" ");
                 switch (getOperation(message)) {
@@ -134,8 +126,8 @@ public class Dstore {
             }
         }
 
-        public void store(String filename, Integer filesize, Boolean isRebalance) {
-            logger.info("Store operation started for file: '" + filename + "'");
+        private void store(String filename, Integer filesize, Boolean isRebalance) {
+            logger.info("Store operation started for file: '" + filename + "'..");
             out.println(Protocol.ACK); // Notify client message received
             try {
                 byte[] data = new byte[filesize];  //Get data from client
@@ -151,13 +143,14 @@ public class Dstore {
             } 
         }
 
-        public void load(String filename) {
-            logger.info("Load operation started for file: '" + filename + "'");
+        private void load(String filename) {
+            logger.info("Load operation started for file: '" + filename + "'..");
             try {
                 Path path = Paths.get(fileFolder, filename);
                 if (!Files.exists(path)) return; // If file doesn't exist
-                byte[] data = Files.readAllBytes(path);
-                socket.getOutputStream().write(data);
+                byte[] data = Files.readAllBytes(path); // Read file
+
+                socket.getOutputStream().write(data); // Send data
                 logger.info("Load of file '" + filename + "' complete");
             } catch (Exception e) {
                 logger.err("Error loading file: " + filename + "'");
@@ -165,37 +158,32 @@ public class Dstore {
         }
     }
 
-    private static class ControllerHandler implements Runnable {
-        private final Socket socket;
-        private final PrintWriter cout;
-        private final BufferedReader cin;
+    private static class ControllerHandler extends ConnectionHandler {
         //Logger
-        private static Logger logger = Logger.getLogger(ControllerHandler.class);
+        private static final Logger logger = Logger.getLogger(ControllerHandler.class);
 
         public ControllerHandler(Socket socket) throws IOException {
-            this.socket = socket;
-            this.cout = new PrintWriter(socket.getOutputStream(), true);
-            this.cin = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            super(socket);
 
-            cout.println("JOIN " + port);
+            out.println("JOIN " + port);
             logger.info("Connected to Controller");
         }
 
         public void sendMessage(String message) {
-            cout.println(message);
+            out.println(message);
         }
 
         public void run() {
-            try (socket; cin; cout) {
+            try (socket; in; out) {
                 String message;
-                while ((message = cin.readLine()) != null) handleMessage(message);
+                while ((message = in.readLine()) != null) handleMessage(message);
             } catch (Exception e) { } finally { 
                 logger.info("Server connection offline");
                 System.exit(0);
             }
         }
 
-        public void handleMessage(String message) {
+        private void handleMessage(String message) {
             try {
                 var arguments = message.split(" ");
                 switch (getOperation(message)) {
@@ -227,43 +215,40 @@ public class Dstore {
             } 
         }
 
-        public void list() {
-            logger.info("List operation started");
+        private void list() {
+            logger.info("List operation started..");
             try (Stream<Path> stream = Files.list(Paths.get(fileFolder))) {
                 var files = String.join(" ", stream.filter(file -> !Files.isDirectory(file))
-                            .map(Path::getFileName)
-                            .map(Path::toString)
+                            .map(Path::getFileName).map(Path::toString)
                             .collect(Collectors.toList()));
-                cout.println((files.length() == 0) ? Protocol.LIST : Protocol.LIST + " " + files);    
+                out.println((files.length() == 0) ? Protocol.LIST : Protocol.LIST + " " + files);    
                 logger.info("List complete");         
             } catch (Exception e) {
                 logger.err("Error in list operation");
             }
         }
 
-        public void remove(String filename) {
-            logger.info("Remove operation started for: '" + filename + "'");
+        private void remove(String filename) {
+            logger.info("Remove operation started for: '" + filename + "'..");
             Path path = Paths.get(fileFolder, filename);
             try {
-                if (Files.deleteIfExists(path)) cout.println(Protocol.REMOVE_ACK + " " + filename);
-                else cout.println(Protocol.ERROR_FILE_DOES_NOT_EXIST + " " + filename);
+                if (Files.deleteIfExists(path)) out.println(Protocol.REMOVE_ACK + " " + filename);
+                else out.println(Protocol.ERROR_FILE_DOES_NOT_EXIST + " " + filename);
                 logger.info("Removal of file: '" + filename + "' complete");
             } catch (IOException e) {
                 logger.err("Error removing file: " + filename);
             }
         }
 
-        public void rebalance(HashMap<String, Set<Integer>> filesToSend, ArrayList<String> filesToDelete) {
-            logger.info("Rebalance operation started");
+        private void rebalance(HashMap<String, Set<Integer>> filesToSend, ArrayList<String> filesToDelete) {
+            logger.info("Rebalance operation started..");
             Set<SendFile> allFilesSend = new HashSet<>();
 
             filesToSend.entrySet().stream().forEach(e -> {
                 Integer filesize;
                 try { filesize = (int) Files.size(Paths.get(fileFolder, e.getKey()));
                 } catch (Exception e1) { return; }
-                e.getValue().forEach(p -> {
-                    allFilesSend.add(new SendFile(e.getKey(), p, filesize));
-                });
+                e.getValue().forEach(p ->  allFilesSend.add(new SendFile(e.getKey(), p, filesize)));
             });
             try {
                 var results = taskPool.invokeAll(allFilesSend);
@@ -278,14 +263,14 @@ public class Dstore {
                 try { Files.deleteIfExists(Paths.get(fileFolder, f));
                 } catch (Exception e) { return; }
             });
-            cout.println(Protocol.REBALANCE_COMPLETE);
+            out.println(Protocol.REBALANCE_COMPLETE);
             logger.info("Rebalance operation complete");
         }
 
-        public static class SendFile implements Callable<Boolean> {
-            String filename;
-            Integer filesize;
-            Integer port;
+        private static class SendFile implements Callable<Boolean> {
+            private final String filename;
+            private final Integer filesize;
+            private final Integer port;
     
             public SendFile(String filename, Integer port, Integer filesize) {
                 this.filename = filename;
