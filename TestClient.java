@@ -21,8 +21,6 @@ public class TestClient {
 
             File file = new File("testfile");
 
-            client.store(file);
-
             File file1 = new File ("testfile1");
 
             File file2 = new File ("testfile2");

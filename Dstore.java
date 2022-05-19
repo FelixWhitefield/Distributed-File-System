@@ -260,7 +260,9 @@ public class Dstore {
             } catch (Exception e1) { return; }
 
             filesToDelete.forEach(f -> {
-                try { Files.deleteIfExists(Paths.get(fileFolder, f));
+                try { 
+                    logger.info("Deleting file '" + f + "'");
+                    Files.deleteIfExists(Paths.get(fileFolder, f));
                 } catch (Exception e) { return; }
             });
             out.println(Protocol.REBALANCE_COMPLETE);

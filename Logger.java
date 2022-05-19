@@ -25,7 +25,7 @@ public class Logger {
     public void err(Object message) {
         Date date = new Date();
 
-        System.err.println("\u001B[31m" + sdf.format(date) + " | " + callerName + " | Thread " 
-            + Thread.currentThread().getId() + " | " + "ERROR | " + String.valueOf(message) + "\u001B[0m");
+        System.err.println(sdf.format(date) + " | " + callerName + " | Thread " 
+            + Thread.currentThread().getId() + " | " + "ERROR | " + String.valueOf(message));
     }
 }
