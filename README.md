@@ -4,6 +4,8 @@ This project was for COMP2207 Distributed Systems and Networks Cousework 2021/22
 
 The aim of this project was to create a Distributed Storage System.
 
+> This project gained a mark of 100%.
+
 ## How it works
 ### Controller
 ```
